@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from configs import dify_config
+from core.db.session_factory import session_factory
 from core.entities.knowledge_entities import PreviewDetail
 from core.model_manager import ModelInstance
 from core.rag.cleaner.clean_processor import CleanProcessor
@@ -148,17 +149,18 @@ class ParentChildIndexProcessor(BaseIndexProcessor):
         if delete_summaries:
             if node_ids:
                 # Find segments by index_node_id
-                segments = (
-                    db.session.query(DocumentSegment)
-                    .filter(
-                        DocumentSegment.dataset_id == dataset.id,
-                        DocumentSegment.index_node_id.in_(node_ids),
+                with session_factory.create_session() as session:
+                    segments = (
+                        session.query(DocumentSegment)
+                        .filter(
+                            DocumentSegment.dataset_id == dataset.id,
+                            DocumentSegment.index_node_id.in_(node_ids),
+                        )
+                        .all()
                     )
-                    .all()
-                )
-                segment_ids = [segment.id for segment in segments]
-                if segment_ids:
-                    SummaryIndexService.delete_summaries_for_segments(dataset, segment_ids)
+                    segment_ids = [segment.id for segment in segments]
+                    if segment_ids:
+                        SummaryIndexService.delete_summaries_for_segments(dataset, segment_ids)
             else:
                 # Delete all summaries for the dataset
                 SummaryIndexService.delete_summaries_for_segments(dataset, None)
@@ -362,7 +364,7 @@ class ParentChildIndexProcessor(BaseIndexProcessor):
         For each parent chunk in preview_texts, concurrently call generate_summary to generate a summary
         and write it to the summary attribute of PreviewDetail.
         In preview mode (indexing-estimate), if any summary generation fails, the method will raise an exception.
-        
+
         Note: For parent-child structure, we only generate summaries for parent chunks.
         """
         import concurrent.futures
@@ -379,6 +381,7 @@ class ParentChildIndexProcessor(BaseIndexProcessor):
         def process(preview: PreviewDetail) -> None:
             """Generate summary for a single preview item (parent chunk)."""
             from core.rag.index_processor.processor.paragraph_index_processor import ParagraphIndexProcessor
+
             if flask_app:
                 # Ensure Flask app context in worker thread
                 with flask_app.app_context():
@@ -403,10 +406,7 @@ class ParentChildIndexProcessor(BaseIndexProcessor):
         errors: list[Exception] = []
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(preview_texts))) as executor:
-            futures = [
-                executor.submit(process, preview)
-                for preview in preview_texts
-            ]
+            futures = [executor.submit(process, preview) for preview in preview_texts]
             # Wait for all tasks to complete with timeout
             done, not_done = concurrent.futures.wait(futures, timeout=timeout_seconds)
 

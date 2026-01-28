@@ -45,6 +45,7 @@ from services.entities.knowledge_entities.knowledge_entities import (
     Segmentation,
 )
 from services.file_service import FileService
+from services.summary_index_service import SummaryIndexService
 
 
 class DocumentTextCreatePayload(BaseModel):
@@ -508,6 +509,31 @@ class DocumentListApi(DatasetApiResource):
         )
         documents = paginated_documents.items
 
+        # Check if dataset has summary index enabled
+        has_summary_index = dataset.summary_index_setting and dataset.summary_index_setting.get("enable") is True
+
+        # Filter documents that need summary calculation
+        documents_need_summary = [doc for doc in documents if doc.need_summary is True]
+        document_ids_need_summary = [str(doc.id) for doc in documents_need_summary]
+
+        # Calculate summary_index_status for documents that need summary (only if dataset summary index is enabled)
+        summary_status_map: dict[str, str | None] = {}
+        if has_summary_index and document_ids_need_summary:
+            summary_status_map = SummaryIndexService.get_documents_summary_index_status(
+                document_ids=document_ids_need_summary,
+                dataset_id=dataset_id,
+                tenant_id=tenant_id,
+            )
+
+        # Add summary_index_status to each document
+        for document in documents:
+            if has_summary_index and document.need_summary is True:
+                # Get status from map, default to None (not queued yet)
+                document.summary_index_status = summary_status_map.get(str(document.id))  # type: ignore[assignment]
+            else:
+                # Return null if summary index is not enabled or document doesn't need summary
+                document.summary_index_status = None  # type: ignore[assignment]
+
         response = {
             "data": marshal(documents, document_fields),
             "has_more": len(documents) == query_params.limit,
@@ -612,6 +638,16 @@ class DocumentApi(DatasetApiResource):
         if metadata not in self.METADATA_CHOICES:
             raise InvalidMetadataError(f"Invalid metadata value: {metadata}")
 
+        # Calculate summary_index_status if needed
+        summary_index_status = None
+        has_summary_index = dataset.summary_index_setting and dataset.summary_index_setting.get("enable") is True
+        if has_summary_index and document.need_summary is True:
+            summary_index_status = SummaryIndexService.get_document_summary_index_status(
+                document_id=document_id,
+                dataset_id=dataset_id,
+                tenant_id=tenant_id,
+            )
+
         if metadata == "only":
             response = {"id": document.id, "doc_type": document.doc_type, "doc_metadata": document.doc_metadata_details}
         elif metadata == "without":
@@ -646,6 +682,8 @@ class DocumentApi(DatasetApiResource):
                 "display_status": document.display_status,
                 "doc_form": document.doc_form,
                 "doc_language": document.doc_language,
+                "summary_index_status": summary_index_status,
+                "need_summary": document.need_summary if document.need_summary is not None else False,
             }
         else:
             dataset_process_rules = DatasetService.get_process_rules(dataset_id)
@@ -681,6 +719,8 @@ class DocumentApi(DatasetApiResource):
                 "display_status": document.display_status,
                 "doc_form": document.doc_form,
                 "doc_language": document.doc_language,
+                "summary_index_status": summary_index_status,
+                "need_summary": document.need_summary if document.need_summary is not None else False,
             }
 
         return response

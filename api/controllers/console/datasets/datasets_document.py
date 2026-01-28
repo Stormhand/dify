@@ -41,7 +41,7 @@ from fields.document_fields import (
 from libs.datetime_utils import naive_utc_now
 from libs.login import current_account_with_tenant, login_required
 from models import DatasetProcessRule, Document, DocumentSegment, UploadFile
-from models.dataset import DocumentPipelineExecutionLog, DocumentSegmentSummary
+from models.dataset import DocumentPipelineExecutionLog
 from services.dataset_service import DatasetService, DocumentService
 from services.entities.knowledge_entities.knowledge_entities import KnowledgeConfig, ProcessRule, RetrievalModel
 from services.file_service import FileService
@@ -327,76 +327,24 @@ class DatasetDocumentListApi(Resource):
         document_ids_need_summary = [str(doc.id) for doc in documents_need_summary]
 
         # Calculate summary_index_status for documents that need summary (only if dataset summary index is enabled)
-        summary_status_map = {}
+        summary_status_map: dict[str, str | None] = {}
         if has_summary_index and document_ids_need_summary:
-            # Get all segments for these documents (excluding qa_model and re_segment)
-            segments = (
-                db.session.query(DocumentSegment.id, DocumentSegment.document_id)
-                .where(
-                    DocumentSegment.document_id.in_(document_ids_need_summary),
-                    DocumentSegment.status != "re_segment",
-                    DocumentSegment.tenant_id == current_tenant_id,
-                )
-                .all()
+            from services.summary_index_service import SummaryIndexService
+
+            summary_status_map = SummaryIndexService.get_documents_summary_index_status(
+                document_ids=document_ids_need_summary,
+                dataset_id=dataset_id,
+                tenant_id=current_tenant_id,
             )
-
-            # Group segments by document_id
-            document_segments_map = {}
-            for segment in segments:
-                doc_id = str(segment.document_id)
-                if doc_id not in document_segments_map:
-                    document_segments_map[doc_id] = []
-                document_segments_map[doc_id].append(segment.id)
-
-            # Get all summary records for these segments
-            all_segment_ids = [seg.id for seg in segments]
-            summaries = {}
-            if all_segment_ids:
-                summary_records = (
-                    db.session.query(DocumentSegmentSummary)
-                    .where(
-                        DocumentSegmentSummary.chunk_id.in_(all_segment_ids),
-                        DocumentSegmentSummary.dataset_id == dataset_id,
-                        DocumentSegmentSummary.enabled == True,  # Only count enabled summaries
-                    )
-                    .all()
-                )
-                summaries = {summary.chunk_id: summary.status for summary in summary_records}
-
-            # Calculate summary_index_status for each document
-            for doc_id in document_ids_need_summary:
-                segment_ids = document_segments_map.get(doc_id, [])
-                if not segment_ids:
-                    # No segments, status is None (not started)
-                    summary_status_map[doc_id] = None
-                    continue
-
-                # Check if there are any "not_started" or "generating" status summaries
-                # Only check enabled=True summaries (already filtered in query)
-                # If segment has no summary record (summaries.get returns None),
-                # it means the summary is disabled (enabled=False) or not created yet, ignore it
-                has_pending_summaries = any(
-                    summaries.get(segment_id) is not None  # Ensure summary exists (enabled=True)
-                    and summaries[segment_id] in ("not_started", "generating")
-                    for segment_id in segment_ids
-                )
-
-                if has_pending_summaries:
-                    # Task is still running (not started or generating)
-                    summary_status_map[doc_id] = "SUMMARIZING"
-                else:
-                    # All enabled=True summaries are "completed" or "error", task finished
-                    # Or no enabled=True summaries exist (all disabled)
-                    summary_status_map[doc_id] = None
 
         # Add summary_index_status to each document
         for document in documents:
             if has_summary_index and document.need_summary is True:
                 # Get status from map, default to None (not queued yet)
-                document.summary_index_status = summary_status_map.get(str(document.id))
+                document.summary_index_status = summary_status_map.get(str(document.id))  # type: ignore[assignment]
             else:
                 # Return null if summary index is not enabled or document doesn't need summary
-                document.summary_index_status = None
+                document.summary_index_status = None  # type: ignore[assignment]
 
         if fetch:
             for document in documents:
@@ -1403,14 +1351,7 @@ class DocumentGenerateSummaryApi(Resource):
             raise ValueError("Summary index is not enabled for this dataset. Please enable it in the dataset settings.")
 
         # Verify all documents exist and belong to the dataset
-        documents = (
-            db.session.query(Document)
-            .filter(
-                Document.id.in_(document_list),
-                Document.dataset_id == dataset_id,
-            )
-            .all()
-        )
+        documents = DocumentService.get_documents_by_ids(dataset_id, document_list)
 
         if len(documents) != len(document_list):
             found_ids = {doc.id for doc in documents}
@@ -1462,9 +1403,6 @@ class DocumentSummaryStatusApi(DocumentResource):
         dataset_id = str(dataset_id)
         document_id = str(document_id)
 
-        # Get document
-        document = self.get_document(dataset_id, document_id)
-
         # Get dataset
         dataset = DatasetService.get_dataset(dataset_id)
         if not dataset:
@@ -1476,83 +1414,12 @@ class DocumentSummaryStatusApi(DocumentResource):
         except services.errors.account.NoPermissionError as e:
             raise Forbidden(str(e))
 
-        # Get all segments for this document
-        segments = (
-            db.session.query(DocumentSegment)
-            .filter(
-                DocumentSegment.document_id == document_id,
-                DocumentSegment.dataset_id == dataset_id,
-                DocumentSegment.status == "completed",
-                DocumentSegment.enabled == True,
-            )
-            .all()
+        # Get summary status detail from service
+        from services.summary_index_service import SummaryIndexService
+
+        result = SummaryIndexService.get_document_summary_status_detail(
+            document_id=document_id,
+            dataset_id=dataset_id,
         )
 
-        total_segments = len(segments)
-
-        # Get all summary records for these segments
-        segment_ids = [segment.id for segment in segments]
-        summaries = []
-        if segment_ids:
-            summaries = (
-                db.session.query(DocumentSegmentSummary)
-                .filter(
-                    DocumentSegmentSummary.document_id == document_id,
-                    DocumentSegmentSummary.dataset_id == dataset_id,
-                    DocumentSegmentSummary.chunk_id.in_(segment_ids),
-                    DocumentSegmentSummary.enabled == True,  # Only return enabled summaries
-                )
-                .all()
-            )
-
-        # Create a mapping of chunk_id to summary
-        summary_map = {summary.chunk_id: summary for summary in summaries}
-
-        # Count statuses
-        status_counts = {
-            "completed": 0,
-            "generating": 0,
-            "error": 0,
-            "not_started": 0,
-        }
-
-        summary_list = []
-        for segment in segments:
-            summary = summary_map.get(segment.id)
-            if summary:
-                status = summary.status
-                status_counts[status] = status_counts.get(status, 0) + 1
-                summary_list.append(
-                    {
-                        "segment_id": segment.id,
-                        "segment_position": segment.position,
-                        "status": summary.status,
-                        "summary_preview": (
-                            summary.summary_content[:100] + "..."
-                            if summary.summary_content and len(summary.summary_content) > 100
-                            else summary.summary_content
-                        ),
-                        "error": summary.error,
-                        "created_at": int(summary.created_at.timestamp()) if summary.created_at else None,
-                        "updated_at": int(summary.updated_at.timestamp()) if summary.updated_at else None,
-                    }
-                )
-            else:
-                status_counts["not_started"] += 1
-                summary_list.append(
-                    {
-                        "segment_id": segment.id,
-                        "segment_position": segment.position,
-                        "status": "not_started",
-                        "summary_preview": None,
-                        "error": None,
-                        "created_at": None,
-                        "updated_at": None,
-                    }
-                )
-
-        return {
-            "total_segments": total_segments,
-            "summary_status": status_counts,
-            "summaries": summary_list,
-        }, 200
+        return result, 200

@@ -212,6 +212,7 @@ class DatasetService:
         embedding_model_provider: str | None = None,
         embedding_model_name: str | None = None,
         retrieval_model: RetrievalModel | None = None,
+        summary_index_setting: dict | None = None,
     ):
         # check if dataset name already exists
         if db.session.query(Dataset).filter_by(name=name, tenant_id=tenant_id).first():
@@ -254,6 +255,8 @@ class DatasetService:
         dataset.retrieval_model = retrieval_model.model_dump() if retrieval_model else None
         dataset.permission = permission or DatasetPermissionEnum.ONLY_ME
         dataset.provider = provider
+        if summary_index_setting is not None:
+            dataset.summary_index_setting = summary_index_setting
         db.session.add(dataset)
         db.session.flush()
 
@@ -905,10 +908,6 @@ class DatasetService:
         # If old setting doesn't exist, no need to regenerate (no existing summaries to regenerate)
         # Note: This task only regenerates existing summaries, not generates new ones
         if not old_summary_setting:
-            return False
-
-        # If old setting was disabled, no need to regenerate (no existing summaries to regenerate)
-        if not old_summary_setting.get("enable"):
             return False
 
         # Compare model_name and model_provider_name
@@ -3385,9 +3384,7 @@ class SegmentService:
                                 SummaryIndexService.generate_and_vectorize_summary(
                                     segment, dataset, dataset.summary_index_setting
                                 )
-                                logger.info(
-                                    "Auto-regenerated summary for segment %s after content change", segment.id
-                                )
+                                logger.info("Auto-regenerated summary for segment %s after content change", segment.id)
                             except Exception:
                                 logger.exception("Failed to auto-regenerate summary for segment %s", segment.id)
                                 # Don't fail the entire update if summary regeneration fails
@@ -3401,9 +3398,7 @@ class SegmentService:
 
                             try:
                                 SummaryIndexService.update_summary_for_segment(segment, dataset, args.summary)
-                                logger.info(
-                                    "Updated summary for segment %s with user-provided content", segment.id
-                                )
+                                logger.info("Updated summary for segment %s with user-provided content", segment.id)
                             except Exception:
                                 logger.exception("Failed to update summary for segment %s", segment.id)
                                 # Don't fail the entire update if summary update fails
@@ -3815,6 +3810,39 @@ class SegmentService:
             .first()
         )
         return result if isinstance(result, DocumentSegment) else None
+
+    @classmethod
+    def get_segments_by_document_and_dataset(
+        cls,
+        document_id: str,
+        dataset_id: str,
+        status: str | None = None,
+        enabled: bool | None = None,
+    ) -> Sequence[DocumentSegment]:
+        """
+        Get segments for a document in a dataset with optional filtering.
+
+        Args:
+            document_id: Document ID
+            dataset_id: Dataset ID
+            status: Optional status filter (e.g., "completed")
+            enabled: Optional enabled filter (True/False)
+
+        Returns:
+            Sequence of DocumentSegment instances
+        """
+        query = select(DocumentSegment).where(
+            DocumentSegment.document_id == document_id,
+            DocumentSegment.dataset_id == dataset_id,
+        )
+
+        if status is not None:
+            query = query.where(DocumentSegment.status == status)
+
+        if enabled is not None:
+            query = query.where(DocumentSegment.enabled == enabled)
+
+        return db.session.scalars(query).all()
 
 
 class DatasetCollectionBindingService:
