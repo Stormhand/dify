@@ -252,7 +252,15 @@ class SummaryIndexService:
                     logger.debug("Using provided session for vectorization of segment %s", segment.id)
                     session_context = None  # Don't use context manager for provided session
 
+                # At this point, session is guaranteed to be not None
+                # Type narrowing: session is definitely not None after the if/else above
+                if session is None:
+                    raise RuntimeError("Session should not be None at this point")
+
                 try:
+                    # Declare summary_record_in_session variable
+                    summary_record_in_session: DocumentSegmentSummary | None
+
                     # If using provided session, merge the summary_record into it
                     if use_provided_session:
                         # Merge the summary_record into the provided session
@@ -336,6 +344,10 @@ class SummaryIndexService:
                                 summary_record_id,
                                 segment.id,
                             )
+
+                        # At this point, summary_record_in_session is guaranteed to be not None
+                        if summary_record_in_session is None:
+                            raise RuntimeError("summary_record_in_session should not be None at this point")
 
                     # Update all fields including summary_content
                     # Always use the summary_content from the parameter (which is the latest from outer session)
@@ -447,6 +459,7 @@ class SummaryIndexService:
                     # Even if original_session was provided, we create a new one for safety
                     with session_factory.create_session() as error_session:
                         # Try to find the record by id first
+                        # Note: Using assignment only (no type annotation) to avoid redeclaration error
                         summary_record_in_session = (
                             error_session.query(DocumentSegmentSummary).filter_by(id=summary_record_id).first()
                         )
@@ -1046,7 +1059,7 @@ class SummaryIndexService:
                     # Update summary content
                     summary_record.summary_content = summary_content
                     summary_record.status = "generating"
-                    summary_record.error = None  # Clear any previous errors
+                    summary_record.error = None  # type: ignore[assignment]  # Clear any previous errors
                     session.add(summary_record)
                     # Flush to ensure summary_content is saved before vectorize_summary queries it
                     session.flush()
